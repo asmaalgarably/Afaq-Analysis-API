@@ -730,8 +730,8 @@ def generate_report(image_bytes: bytes, child_id: str, child_name: str = "", chi
 وتنمية الخيال والإبداع. كل رسمة هي نافذة إلى عالم الطفل الداخلي.
 
 مع أطيب التمنيات،
-فريق عمل أفاق للتحليل النفسي الفني
-📧 support@afaq-project.com
+فريق عمل أفق للتحليل النفسي الفني
+📧 support@afaq.com
 """)
 
     full_report_text = "\n".join(report_sections).strip()
@@ -805,7 +805,7 @@ def send_email_gmail(parent_email: str, subject: str, analysis_text: str) -> boo
         # إرسال الإيميل
         server = None
         try:
-            # جرب منفذ 587 (TLS)
+          
             server = smtplib.SMTP("smtp.gmail.com", 587, timeout=10)
             server.starttls()
             server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
@@ -815,9 +815,9 @@ def send_email_gmail(parent_email: str, subject: str, analysis_text: str) -> boo
         except Exception as e1:
             logger.warning(f"⚠️ فشل الإرسال عبر 587: {e1}. تجربة 465 (SSL)...")
             if server:
-                server.quit()  # إنهاء الاتصال السابق
+                server.quit()  
 
-            # جرب منفذ 465 (SSL) كبديل
+            
             try:
                 server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10)
                 server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
@@ -974,7 +974,7 @@ def common_analysis_logic(send_email: bool = True):
 
         if send_email:
             # 3. إرسال الإيميل
-            email_subject = f"تقرير رسم الطفل {child_id} - مشروع أفاق"
+            email_subject = f"تقرير رسم الطفل {child_id} - مشروع أفق"
             email_sent = send_email_gmail(
                 parent_email, email_subject, report_text)
 
