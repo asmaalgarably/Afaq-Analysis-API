@@ -4,9 +4,6 @@ import cv2
 import numpy as np
 import requests
 from flask import Flask, request, jsonify, abort
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from collections import Counter
 import traceback
 import tempfile
@@ -16,6 +13,8 @@ import logging
 from datetime import datetime, timedelta
 import re
 import time
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 # ----------------------------------
 # إعدادات التسجيل
@@ -27,24 +26,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------------------------
-# إعدادات المشروع
+# إعدادات المشروع (متغيرات البيئة)
 # ----------------------------------
-load_dotenv()  # يحمّل كل القيم من ملف .env
+load_dotenv() 
 
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "").strip()
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "").strip()
-
-# التحقق من المتغيرات البيئية
-REQUIRED_ENV_VARS = ["HF_TOKEN", "GMAIL_SENDER", "GMAIL_APP_PASSWORD"]
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
+REQUIRED_ENV_VARS = ["HF_TOKEN", "GMAIL_SENDER", "SENDGRID_API_KEY"]
 missing_vars = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
 if missing_vars:
-    logger.warning(f"⚠️ متغيرات بيئية مفقودة: {missing_vars}")
+    logger.warning(f"متغيرات بيئية مفقودة: {missing_vars}")
 
 # ----------------------------------
-# دوال مساعدة - الآن تقبل بايتات (bytes) أو مصفوفة (np.ndarray)
+# دوال مساعدة
 # ----------------------------------
-
 
 def validate_image_file_content(file_bytes: bytes, filename: str) -> Tuple[bool, str]:
     """التحقق من صحة محتوى ملف الصورة في الذاكرة"""
@@ -80,8 +76,6 @@ def load_and_preprocess_image(image_bytes: bytes) -> np.ndarray:
 
     if img is None:
         raise ValueError("فشل في قراءة الصورة من الذاكرة")
-
-    # تصغير الصورة إذا كانت كبيرة جداً للحفاظ على الأداء
     height, width = img.shape[:2]
     max_dimension = 1200
 
@@ -99,7 +93,6 @@ def rgb_to_hex(r, g, b):
 
 
 def get_color_name(rgb_values):
-    """الحصول على اسم تقريبي للون"""
     r, g, b = rgb_values
 
     # قاعدة بيانات ألوان مبسطة
@@ -118,16 +111,14 @@ def get_color_name(rgb_values):
         ((165, 42, 42), "بني"),
         ((255, 192, 203), "وردي"),
     ]
-
-    # البحث عن أقرب لون
+ 
     min_distance = float('inf')
     closest_color = "غير معروف"
 
     for color_rgb, color_name in colors_db:
-        # حساب المسافة الإقليدية (Euclidean Distance)
         distance = np.sqrt((r - color_rgb[0])**2 +
-                           (g - color_rgb[1])**2 +
-                           (b - color_rgb[2])**2)
+                            (g - color_rgb[1])**2 +
+                            (b - color_rgb[2])**2)
         if distance < min_distance:
             min_distance = distance
             closest_color = color_name
@@ -136,7 +127,6 @@ def get_color_name(rgb_values):
 
 
 def analyze_colors(img_bytes: bytes) -> List[Dict]:
-    """تحليل الألوان الأساسية في الرسم بدون sklearn"""
     try:
         img = load_and_preprocess_image(img_bytes)
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -148,7 +138,7 @@ def analyze_colors(img_bytes: bytes) -> List[Dict]:
 
         # تجميع الألوان يدوياً
         color_bins = {}
-        bin_size = 32  # تجميع كل 32 قيمة لون في bin واحد
+        bin_size = 32   
 
         for pixel in pixels:
             r, g, b = pixel
@@ -202,7 +192,7 @@ def analyze_emotion_from_colors(colors):
     }
 
     emotions = []
-    for color_info in colors[:3]:  # أول 3 ألوان
+    for color_info in colors[:3]:   
         color_name = color_info.get("name", "")
         if color_name in emotion_map:
             emotions.append(f"{color_name}: {emotion_map[color_name]}")
@@ -227,9 +217,9 @@ def analyze_lines(img_bytes: bytes) -> Dict:
 
         # اكتشاف الخطوط
         lines = cv2.HoughLinesP(edges, 1, np.pi/180,
-                                threshold=50,
-                                minLineLength=30,
-                                maxLineGap=10)
+                                 threshold=50,
+                                 minLineLength=30,
+                                 maxLineGap=10)
 
         if lines is not None:
             angles = []
@@ -310,7 +300,7 @@ def analyze_shapes(img_bytes: bytes) -> Dict:
 
         # العتبة التكيفية
         thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, 11, 2)
+                                         cv2.THRESH_BINARY_INV, 11, 2)
 
         # تنظيف الصورة
         kernel = np.ones((3, 3), np.uint8)
@@ -319,7 +309,7 @@ def analyze_shapes(img_bytes: bytes) -> Dict:
 
         # إيجاد الكنتورات
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
+                                         cv2.CHAIN_APPROX_SIMPLE)
 
         shape_counts = Counter()
         # مساحة كافية (مثلاً 0.01% من إجمالي البيكسلات)
@@ -336,7 +326,7 @@ def analyze_shapes(img_bytes: bytes) -> Dict:
 
             # حساب الدائرية
             circularity = (4 * np.pi * area) / (perimeter *
-                                                perimeter) if perimeter > 0 else 0
+                                                 perimeter) if perimeter > 0 else 0
 
             shape_type = "other"
 
@@ -486,13 +476,13 @@ def blip_caption(image_bytes: bytes) -> str:
 
         headers = {"Authorization": f"Bearer {HF_TOKEN}"}
 
-        # استخدام نموذج موثوق (nlpconnect/vit-gpt2-image-captioning)
+        # model
         HF_API_URL = "https://api-inference.huggingface.co/models/nlpconnect/vit-gpt2-image-captioning"
 
         response = requests.post(
             HF_API_URL,
             headers=headers,
-            data=image_bytes,  # تمرير البايتات مباشرة
+            data=image_bytes,  
             timeout=30
         )
 
@@ -502,11 +492,7 @@ def blip_caption(image_bytes: bytes) -> str:
                 caption = result[0].get(
                     "generated_text") or result[0].get("caption")
                 if caption:
-                    # **ملاحظة:** هنا يجب إضافة دالة ترجمة (مثل Google Translate) لتحويل الإنجليزية إلى العربية
-                    # حالياً سنعيد النص كما هو
                     return caption
-
-        # جرب نموذج Salesforce/blip-image-captioning-base كبديل
         logger.warning(
             f"⚠️ فشل النموذج الأول ({response.status_code}). تجربة النموذج الثاني...")
         HF_API_URL_2 = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-base"
@@ -747,94 +733,104 @@ def generate_report(image_bytes: bytes, child_id: str, child_name: str = "", chi
     return full_analysis
 
 
-def send_email_gmail(parent_email: str, subject: str, analysis_text: str) -> bool:
-    """إرسال إيميل بسيط يعمل في معظم الحالات"""
+# -------------------------------------------------------------
+#  دالة إرسال الإيميل باستخدام SendGrid
+# -------------------------------------------------------------
+def send_email_sendgrid(parent_email: str, subject: str, analysis_data: Dict, child_name: str, child_id: str) -> Tuple[bool, str]:
+    """إرسال إيميل التقرير باستخدام SendGrid API (بدلاً من Gmail/SMTP)"""
     try:
-        logger.info(f"📧 بدء إرسال إيميل إلى: {parent_email}")
+        logger.info(f"📧 بدء إرسال إيميل إلى: {parent_email} عبر SendGrid")
 
-        if not GMAIL_SENDER or not GMAIL_APP_PASSWORD or not parent_email or '@' not in parent_email:
-            logger.error("❌ بيانات البريد ناقصة أو إيميل غير صالح")
-            return False
+        if not SENDGRID_API_KEY or not GMAIL_SENDER or not parent_email:
+            return False, "❌ بيانات البريد ناقصة أو إيميل غير صالح أو مفتاح SendGrid مفقود"
 
-        # إنشاء الرسالة
-        msg = MIMEMultipart('alternative')
-        msg['Subject'] = subject
-        msg['From'] = GMAIL_SENDER
-        msg['To'] = parent_email
+        # 1. تجهيز المحتوى الديناميكي لـ HTML (ملخص النقاط)
+        psychological_notes = analysis_data.get('psychological_notes', [])
+        educational_advice = analysis_data.get('educational_advice', [])
+        summary_points = psychological_notes + educational_advice
+        
+        summary_html = ""
+        for item in summary_points[:5]: 
+            summary_html += f'<li style="margin-bottom: 8px; font-size: 15px;"><span style="color: #28a745;">✅</span> {item}</li>'
+        
+        # رابط افتراضي لصفحة التقرير الكامل
+        report_link = f"https://afaq-analysis-api.onrender.com/report/{child_id}" 
 
-        # المحتوى النصي
-        text_content = analysis_text
-
-        # المحتوى HTML
+        # 2. بناء محتوى الإيميل HTML 
         html_content = f"""
-<!DOCTYPE html>
-<html dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <style>
-        body {{ font-family: 'Arial', sans-serif; line-height: 1.6; color: #333; }}
-        .container {{ max-width: 700px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px; }}
-        .header {{ background: #4CAF50; color: white; padding: 20px; text-align: center; border-radius: 8px 8px 0 0;}}
-        .content {{ padding: 20px; background: #f9f9f9; white-space: pre-wrap; }}
-        .footer {{ margin-top: 20px; padding: 10px; text-align: center; color: #666; font-size: 12px; border-top: 1px solid #ddd; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h2>تقرير تحليل الرسم الفني</h2>
-            <p>مشروع أفاق للتحليل النفسي للأطفال</p>
-        </div>
-        <div class="content">
-            <pre style="white-space: pre-wrap; font-family: inherit;">{analysis_text}</pre>
-        </div>
-        <div class="footer">
-            <p>تم إنشاء هذا التقرير تلقائياً. © 2024 مشروع أفاق</p>
-        </div>
-    </div>
-</body>
-</html>
+        <!DOCTYPE html>
+        <html lang="ar" dir="rtl">
+        <head>
+            <meta charset="UTF-8">
+            <title>{subject}</title>
+        </head>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333333; background-color: #f4f4f4; padding: 20px;">
+            <div style="max-width: 600px; margin: 20px auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 10px; background-color: #ffffff;">
+
+                <div style="text-align: center; padding-bottom: 20px; border-bottom: 1px solid #eeeeee;">
+                    <h1 style="color: #007bff; margin: 0; font-size: 24px;">نتائج تحليل رسم طفلك ✨</h1>
+                    <p style="color: #666; margin: 5px 0 0;">منصة أفق للتحليل النفسي الفني</p>
+                </div>
+
+                <div style="padding-top: 20px;">
+                    <p style="font-size: 16px;">
+                        تحية طيبة، ولي أمر **{child_name}**،
+                    </p>
+                    <p style="font-size: 16px;">
+                        يسر فريق "أفق" أن يشاركك تقرير تحليل الرسم الخاص بطفلك. نقدم لك ملخصًا لأهم الاستنتاجات:
+                    </p>
+
+                    <div style="background-color: #f7f7f7; padding: 15px; border-radius: 8px; margin-top: 20px; margin-bottom: 20px; border-right: 5px solid #28a745;">
+                        <h3 style="color: #28a745; margin-top: 0; font-size: 18px; text-align: right;">📋 أهم النقاط:</h3>
+                        <ul style="list-style-type: none; padding-right: 0; margin-right: 15px;">
+                            {summary_html}
+                        </ul>
+                    </div>
+
+                    <p style="font-size: 16px;">
+                        للاطلاع على التقرير التفصيلي الكامل، يرجى النقر على الزر أدناه.
+                    </p>
+
+                    <div style="text-align: center; margin-top: 30px;">
+                        <a href="{report_link}" 
+                           style="display: inline-block; padding: 12px 25px; background-color: #007bff; color: #ffffff; text-decoration: none; border-radius: 5px; font-weight: bold; font-size: 16px;">
+                            عرض التقرير الكامل الآن
+                        </a>
+                    </div>
+                </div>
+
+                <div style="text-align: center; padding-top: 20px; border-top: 1px solid #eeeeee; margin-top: 20px;">
+                    <p style="margin: 0; font-size: 12px; color: #999999;">
+                        هذه الرسالة تم إرسالها تلقائيًا. شكرًا لثقتكم في "أفق".
+                    </p>
+                </div>
+            </div>
+        </body>
+        </html>
         """
 
-        # إرفاق المحتوى
-        part1 = MIMEText(text_content, 'plain', 'utf-8')
-        part2 = MIMEText(html_content, 'html', 'utf-8')
-        msg.attach(part1)
-        msg.attach(part2)
-
-        # إرسال الإيميل
-        server = None
-        try:
-          
-            server = smtplib.SMTP("smtp.gmail.com", 587, timeout=10)
-            server.starttls()
-            server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
-            server.send_message(msg)
-            logger.info("✅ تم إرسال الإيميل بنجاح (587/TLS)")
-            return True
-        except Exception as e1:
-            logger.warning(f"⚠️ فشل الإرسال عبر 587: {e1}. تجربة 465 (SSL)...")
-            if server:
-                server.quit()  
-
-            
-            try:
-                server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10)
-                server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
-                server.send_message(msg)
-                logger.info("✅ تم إرسال الإيميل بنجاح (465/SSL)")
-                return True
-            except Exception as e2:
-                logger.error(f"❌ فشل الإرسال عبر 465 أيضاً: {e2}")
-                raise
-
-        finally:
-            if server:
-                server.quit()
+        # 3. إرسال الإيميل باستخدام SendGrid
+        message = Mail(
+            from_email=GMAIL_SENDER,
+            to_emails=parent_email,
+            subject=subject,
+            html_content=html_content
+        )
+        
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
+        
+        if response.status_code == 202: 
+            logger.info("تم الإرسال بنجاح عبر SendGrid (Status 202)")
+            return True, "تم الإرسال بنجاح عبر SendGrid"
+        else:
+            error_details = response.body.decode('utf-8') if response.body else "لا يوجد تفاصيل."
+            logger.error(f" فشل إرسال SendGrid. Status: {response.status_code}. Details: {error_details}")
+            return False, f"فشل SendGrid. Status: {response.status_code}"
 
     except Exception as e:
-        logger.error(f"❌ فشل إرسال الإيميل نهائياً: {e}")
-        return False
+        logger.error(f" خطأ غير متوقع في إرسال SendGrid: {traceback.format_exc()}")
+        return False, f"خطأ غير متوقع: {str(e)}"
 
 
 # ----------------------------------
@@ -842,7 +838,7 @@ def send_email_gmail(parent_email: str, subject: str, analysis_text: str) -> boo
 # ----------------------------------
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB
-app.config['JSON_AS_ASCII'] = False  # دعم العربية في JSON
+app.config['JSON_AS_ASCII'] = False 
 
 # Rate limiting
 request_log = {}
@@ -863,7 +859,7 @@ def rate_limit(max_per_minute=10):
 
             # التحقق من الحد
             if ip in request_log and len(request_log[ip]) >= max_per_minute:
-                logger.warning(f"⏰ تجاوز الحد للـ IP: {ip}")
+                logger.warning(f"  تجاوز الحد للـ IP: {ip}")
                 return jsonify({
                     "status": "error",
                     "message": "تم تجاوز الحد المسموح للطلبات. الرجاء الانتظار دقيقة."
@@ -884,7 +880,7 @@ def home():
     return jsonify({
         "status": "running",
         "service": "Afaq Drawing Analysis API",
-        "version": "3.1 (In-Memory Refactor)",
+        "version": "3.2 (SendGrid Integrated)", 
         "endpoints": {
             "/health": "فحص حالة الخادم",
             "/analyze": "تحليل الرسم وإرسال التقرير (POST)",
@@ -902,7 +898,7 @@ def health_check():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "hf_token_configured": bool(HF_TOKEN),
-        "email_configured": bool(GMAIL_SENDER and GMAIL_APP_PASSWORD),
+        "email_configured": bool(GMAIL_SENDER and SENDGRID_API_KEY), 
     }
     return jsonify(health_status)
 
@@ -912,19 +908,14 @@ def test_connections():
     """فحص الاتصالات الخارجية"""
     tests = {
         "huggingface": "Skipped (need image)",
-        "gmail": False,
+        "sendgrid": False,  
     }
 
-    # فحص Gmail
-    try:
-        if GMAIL_SENDER and GMAIL_APP_PASSWORD:
-            server = smtplib.SMTP("smtp.gmail.com", 587, timeout=5)
-            server.quit()
-            tests["gmail"] = True
-        else:
-            tests["gmail"] = "no_credentials"
-    except Exception as e:
-        tests["gmail"] = f"Failed: {str(e)}"
+   
+    if SENDGRID_API_KEY:
+        tests["sendgrid"] = "Credentials present"
+    else:
+        tests["sendgrid"] = "no_credentials"
 
     return jsonify({
         "status": "success",
@@ -948,7 +939,7 @@ def common_analysis_logic(send_email: bool = True):
     child_age = request.form.get('child_age', '')
     parent_email = request.form.get('parent_email', '')
 
-    file_content = file.read()  # قراءة محتوى الملف بالكامل في الذاكرة
+    file_content = file.read()  
 
     # 1. التحقق من الصحة
     is_valid, message = validate_image_file_content(
@@ -970,64 +961,68 @@ def common_analysis_logic(send_email: bool = True):
         report_text = analysis_data['report_text']
 
         analysis_time = time.time() - analysis_start
-        logger.info(f"✅ تحليل الرسم اكتمل في {analysis_time:.2f} ثانية")
+        logger.info(f" تحليل الرسم اكتمل في {analysis_time:.2f} ثانية")
 
+        email_success = False
+        email_message = "لم يتم طلب إرسال إيميل"
+
+        # 3. إرسال الإيميل  
+        if send_email and parent_email:
+            subject = f"تقرير تحليل رسم الطفل {child_name if child_name else child_id} من فريق أفق"
+            
+           
+            email_success, email_message = send_email_sendgrid(
+                parent_email, 
+                subject, 
+                analysis_data, 
+                child_name, 
+                child_id  
+            )
+            
+            if email_success:
+                logger.info(f" تم إرسال التقرير بنجاح إلى: {parent_email}")
+            else:
+                logger.error(f" فشل إرسال الإيميل إلى {parent_email}: {email_message}")
+        
+        # 4. بناء الاستجابة
+        response_data = {
+            "status": "success",
+            "message": "تم تحليل الرسم بنجاح.",
+            "child_name": child_name,
+            "child_id": child_id,
+            "analysis_time": round(analysis_time, 2),
+            "full_report": report_text,
+            "raw_data": analysis_data['raw_analysis']
+        }
+        
         if send_email:
-            # 3. إرسال الإيميل
-            email_subject = f"تقرير رسم الطفل {child_id} - مشروع أفق"
-            email_sent = send_email_gmail(
-                parent_email, email_subject, report_text)
+            response_data["email_status"] = "success" if email_success else "failed"
+            response_data["email_message"] = email_message
+        
+        return jsonify(response_data)
 
-            email_status = "✅ تم الإرسال بنجاح" if email_sent else "❌ فشل الإرسال"
-            logger.info(f"📧 حالة الإيميل: {email_status}")
-
-            return jsonify({
-                "status": "success",
-                "request_id": request_id,
-                "child_id": child_id,
-                "email_status": email_status,
-                "analysis_time_s": round(analysis_time, 2),
-                "report_summary": analysis_data['psychological_notes'][:2] + analysis_data['educational_advice'][:2],
-                # "full_report_text": report_text # يمكن حذفه للحفاظ على نظافة الـ JSON
-            }), 200
-        else:
-            # 4. إرجاع النتيجة فقط
-            return jsonify({
-                "status": "success",
-                "request_id": request_id,
-                "child_id": child_id,
-                "analysis_time_s": round(analysis_time, 2),
-                "analysis_data": analysis_data  # إرجاع البيانات الخام والنص
-            }), 200
-
-    except ValueError as ve:
-        logger.error(f"❌ خطأ في معالجة الصورة: {ve}")
-        return jsonify({
-            "status": "error",
-            "message": f"خطأ في معالجة الصورة: {str(ve)}"
-        }), 400
     except Exception as e:
-        logger.error(f"❌ خطأ غير متوقع [ID: {request_id}]: {e}")
-        logger.error(traceback.format_exc())
-        return jsonify({
-            "status": "error",
-            "message": f"حدث خطأ غير متوقع: {str(e)}",
-            "traceback": traceback.format_exc().splitlines()
-        }), 500
+        logger.error(f" خطأ غير متوقع في مسار التحليل: {traceback.format_exc()}")
+        abort(500, f"خطأ داخلي في الخادم أثناء معالجة الرسم: {str(e)}")
 
 
 @app.route('/analyze', methods=['POST'])
-@rate_limit(max_per_minute=5)
-def analyze_and_notify():
-    """نقطة النهاية الرئيسية للتحليل وإرسال الإيميل"""
+@rate_limit(max_per_minute=10)
+def analyze_and_send():
+    """مسار تحليل الرسم وإرسال الإيميل"""
     return common_analysis_logic(send_email=True)
 
 
 @app.route('/analyze-only', methods=['POST'])
-@rate_limit(max_per_minute=15)
+@rate_limit(max_per_minute=20)
 def analyze_only():
-    """تحليل الرسم وإرجاع النتيجة في الـ JSON فقط (بدون إيميل)"""
+    """مسار تحليل الرسم فقط بدون إرسال إيميل"""
     return common_analysis_logic(send_email=False)
 
 
- 
+# if __name__ == '__main__':
+#     # لتشغيل الخادم محليًا
+#     if not HF_TOKEN or not GMAIL_SENDER or not SENDGRID_API_KEY:
+#         logger.error(" يرجى توفير كل المتغيرات البيئية الضرورية لتشغيل الخادم محليًا.")
+    
+#     app.run(debug=True, port=int(os.environ.get('PORT', 5000)))

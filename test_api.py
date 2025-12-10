@@ -12,14 +12,14 @@ import time
 IMAGE_FILE_NAME = r"C:\Users\ACER\Desktop\ai_analysis_api\test_drawing.jpg"
 
 # نستخدم analyze لاختبار وظيفة الإيميل
-API_URL = "http://127.0.0.1:5000/analyze"
+API_URL = "https://afaq-analysis-api.onrender.com/analyze"
 
 # 1. إعداد بيانات الحقول النصية (form-data)
 data_fields = {
     "child_id": "Email_Test_003",
     "child_name": "ريم",
     "child_age": "7",
-    "parent_email": "ahmedalgarably49@gmail.com"
+    "parent_email": "asmaalgarably@gmail.com"
 }
 
 # ----------------------------------------------------
