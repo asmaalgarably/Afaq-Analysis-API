@@ -1020,9 +1020,9 @@ def analyze_only():
     return common_analysis_logic(send_email=False)
 
 
-# if __name__ == '__main__':
-#     # لتشغيل الخادم محليًا
-#     if not HF_TOKEN or not GMAIL_SENDER or not SENDGRID_API_KEY:
-#         logger.error(" يرجى توفير كل المتغيرات البيئية الضرورية لتشغيل الخادم محليًا.")
+if __name__ == '__main__':
+    # لتشغيل الخادم محليًا
+    if not HF_TOKEN or not GMAIL_SENDER or not SENDGRID_API_KEY:
+        logger.error(" يرجى توفير كل المتغيرات البيئية الضرورية لتشغيل الخادم محليًا.")
     
-#     app.run(debug=True, port=int(os.environ.get('PORT', 5000)))
+    app.run(debug=True, port=int(os.environ.get('PORT', 5000)))
