@@ -6,7 +6,6 @@ import requests
 from flask import Flask, request, jsonify, abort, render_template_string
 from collections import Counter
 import traceback
-import tempfile
 from typing import Dict, List, Tuple
 from functools import wraps
 import logging
@@ -15,6 +14,9 @@ import re
 import time
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
+from pymongo import MongoClient
+from pymongo.errors import ConnectionError, OperationFailure
+from bson.json_util import dumps  
 
 # ----------------------------------
 # إعدادات التسجيل
@@ -33,13 +35,53 @@ load_dotenv()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "").strip()
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
-REQUIRED_ENV_VARS = ["HF_TOKEN", "GMAIL_SENDER", "SENDGRID_API_KEY"]
+MONGO_URI = os.getenv("MONGO_URI", "").strip()
+
+REQUIRED_ENV_VARS = ["HF_TOKEN", "GMAIL_SENDER",
+                     "SENDGRID_API_KEY", "MONGO_URI"]
 missing_vars = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
 if missing_vars:
     logger.warning(f"متغيرات بيئية مفقودة: {missing_vars}")
 
-# قاموس لتخزين التقارير مؤقتاً (مهم لحل مشكلة 404 في صفحة /report)
-REPORTS_CACHE = {}
+# ----------------------------------
+# إعداد قاعدة البيانات
+# ----------------------------------
+
+MONGO_CLIENT = None
+MONGO_DB = None
+REPORT_COLLECTION = None
+
+
+def setup_mongo():
+    """تهيئة اتصال MongoDB"""
+    global MONGO_CLIENT, MONGO_DB, REPORT_COLLECTION
+
+    if not MONGO_URI:
+        logger.error("MONGO_URI غير متوفر. لن يتم حفظ التقارير.")
+        return False
+
+    try:
+        # إعداد العميل والاتصال
+        MONGO_CLIENT = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
+        # محاولة عمل ping للتحقق من الاتصال
+        MONGO_CLIENT.admin.command('ping')
+
+        MONGO_DB = MONGO_CLIENT.get_database(
+            "AfaqAnalysisDB")  # اسم قاعدة البيانات
+        REPORT_COLLECTION = MONGO_DB.get_collection(
+            "reports")   
+        logger.info("تم الاتصال بقاعدة بيانات MongoDB بنجاح.")
+        return True
+    except ConnectionError as e:
+        logger.error(f"فشل الاتصال بقاعدة بيانات MongoDB: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"خطأ غير متوقع في إعداد MongoDB: {e}")
+        return False
+
+
+# استدعاء دالة التهيئة عند بدء تشغيل التطبيق
+setup_mongo()
 
 
 # ----------------------------------
@@ -47,16 +89,12 @@ REPORTS_CACHE = {}
 # ----------------------------------
 
 def validate_image_file_content(file_bytes: bytes, filename: str) -> Tuple[bool, str]:
-    """التحقق من صحة محتوى ملف الصورة في الذاكرة"""
     ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
 
     if not file_bytes:
         return False, "لم يتم توفير محتوى الملف"
 
     filename = (filename or '').lower().strip()
-    if not filename:
-        return False, "اسم الملف فارغ"
-
     _, ext = os.path.splitext(filename)
 
     if not ext or ext not in ALLOWED_EXTENSIONS:
@@ -65,7 +103,7 @@ def validate_image_file_content(file_bytes: bytes, filename: str) -> Tuple[bool,
 
     file_size = len(file_bytes)
     if file_size == 0:
-        return False, "الملف فارغ"
+        return False, 
     if file_size > 10 * 1024 * 1024:
         size_mb = file_size / (1024 * 1024)
         return False, f"حجم الملف كبير جداً ({size_mb:.1f}MB). الحد الأقصى: 10MB"
@@ -76,7 +114,6 @@ def validate_image_file_content(file_bytes: bytes, filename: str) -> Tuple[bool,
 def load_and_preprocess_image(image_bytes: bytes) -> np.ndarray:
     """تحميل البايتات ومعالجة مسبقة للصورة في الذاكرة"""
     np_arr = np.frombuffer(image_bytes, np.uint8)
-    # يستخدم IMREAD_COLOR بدلاً من IMREAD_GRAYSCALE في دالة التحميل العامة
     img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
     if img is None:
@@ -124,9 +161,23 @@ def get_color_name(rgb_values):
         distance = np.sqrt((r - color_rgb[0])**2 +
                            (g - color_rgb[1])**2 +
                            (b - color_rgb[2])**2)
-        if distance < min_distance:
+        if distance < 50 and distance < min_distance:   
             min_distance = distance
             closest_color = color_name
+        elif min_distance == float('inf'):
+            
+            if r > 200 and g < 50 and b < 50:
+                closest_color = "أحمر ساطع"
+            elif r < 50 and g > 200 and b < 50:
+                closest_color = "أخضر ساطع"
+            elif r < 50 and g < 50 and b > 200:
+                closest_color = "أزرق ساطع"
+            elif r > 200 and g > 200 and b < 50:
+                closest_color = "أصفر ساطع"
+            elif r > 150 and g > 150 and b > 150:
+                closest_color = "لون فاتح"
+            elif r < 100 and g < 100 and b < 100:
+                closest_color = "لون داكن"
 
     return closest_color
 
@@ -155,19 +206,20 @@ def analyze_colors(img_bytes: bytes) -> List[Dict]:
             key = (r_bin, g_bin, b_bin)
             color_bins[key] = color_bins.get(key, 0) + 1
 
-        # الحصول على أكثر 3 ألوان انتشاراً
+        # الحصول على أكثر 5 ألوان انتشاراً
         sorted_colors = sorted(
-            color_bins.items(), key=lambda x: x[1], reverse=True)[:3]
+            color_bins.items(), key=lambda x: x[1], reverse=True)[:5]
 
         total_pixels = len(pixels)
         colors_info = []
         for (r, g, b), count in sorted_colors:
             color_hex = rgb_to_hex(r, g, b)
-            color_name = get_color_name((r, g, b))
+            avg_r, avg_g, avg_b = r + bin_size//2, g + bin_size//2, b + bin_size//2
+            color_name = get_color_name((avg_r, avg_g, avg_b))
             percentage = (count / total_pixels) * 100
 
             colors_info.append({
-                "rgb": f"({r}, {g}, {b})",
+                "rgb": f"({avg_r}, {avg_g}, {avg_b})",
                 "hex": color_hex,
                 "name": color_name,
                 "percentage": round(percentage, 1)
@@ -183,7 +235,7 @@ def analyze_colors(img_bytes: bytes) -> List[Dict]:
 def analyze_emotion_from_colors(colors):
     """تحليل المشاعر من الألوان"""
     emotion_map = {
-        'أحمر': 'طاقة، حماس، عاطفة',
+        'أحمر': 'طاقة، حماس، عاطفة قوية',
         'أخضر': 'توازن، نمو، أمان',
         'أزرق': 'هدوء، استقرار، ثقة',
         'أصفر': 'سعادة، تفاؤل، إبداع',
@@ -197,12 +249,12 @@ def analyze_emotion_from_colors(colors):
     }
 
     emotions = []
-    for color_info in colors[:3]:
+    for color_info in colors:
         color_name = color_info.get("name", "")
-        if color_name in emotion_map:
+        if color_name in emotion_map and color_info.get("percentage", 0) > 10:
             emotions.append(f"{color_name}: {emotion_map[color_name]}")
 
-    return emotions[:5]  # نأخذ أول 5 نتائج
+    return list(dict.fromkeys(emotions))[:5]  
 
 
 def analyze_lines(img_bytes: bytes) -> Dict:
@@ -214,13 +266,9 @@ def analyze_lines(img_bytes: bytes) -> Dict:
         if img is None:
             return {"avg_angle": None, "horizontal": 0, "vertical": 0, "diagonal": 0, "total_lines": 0, "pattern": "فشل التحميل"}
 
-        # تحسين الصورة
         img = cv2.GaussianBlur(img, (5, 5), 0)
-
-        # كشف الحواف
         edges = cv2.Canny(img, 50, 150)
 
-        # اكتشاف الخطوط
         lines = cv2.HoughLinesP(edges, 1, np.pi/180,
                                 threshold=50,
                                 minLineLength=30,
@@ -237,9 +285,7 @@ def analyze_lines(img_bytes: bytes) -> Dict:
                 dx = x2 - x1
                 dy = y2 - y1
 
-                # حساب الزاوية
                 angle = np.degrees(np.arctan2(dy, dx))
-                # تطبيع الزاوية بين -90 و 90
                 if angle > 90:
                     angle -= 180
                 elif angle < -90:
@@ -263,7 +309,6 @@ def analyze_lines(img_bytes: bytes) -> Dict:
                 total = horizontal + vertical + diagonal
                 line_pattern = "متنوع"
                 if total > 0:
-                    # نحدد النمط المسيطر بناءً على النسبة
                     h_pct = horizontal / total
                     v_pct = vertical / total
                     d_pct = diagonal / total
@@ -273,7 +318,7 @@ def analyze_lines(img_bytes: bytes) -> Dict:
                     elif v_pct > 0.4 and v_pct > h_pct and v_pct > d_pct:
                         line_pattern = "عمودي"
                     elif d_pct > 0.4 and d_pct > h_pct and d_pct > v_pct:
-                        line_pattern = "مائل"
+                        line_pattern = "مائل/ديناميكي"
                     elif total < 5:
                         line_pattern = "قليل"
 
@@ -300,25 +345,20 @@ def analyze_shapes(img_bytes: bytes) -> Dict:
         img = load_and_preprocess_image(img_bytes)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # تحسين الصورة
         gray = cv2.medianBlur(gray, 5)
 
-        # العتبة التكيفية
         thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                        cv2.THRESH_BINARY_INV, 11, 2)
 
-        # تنظيف الصورة
         kernel = np.ones((3, 3), np.uint8)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
 
-        # إيجاد الكنتورات
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
 
         shape_counts = Counter()
-        # مساحة كافية (مثلاً 0.01% من إجمالي البيكسلات)
-        min_area = img.size * 0.0001
+        min_area = img.size * 0.0001  
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
@@ -329,7 +369,6 @@ def analyze_shapes(img_bytes: bytes) -> Dict:
             approx = cv2.approxPolyDP(cnt, 0.04 * perimeter, True)
             sides = len(approx)
 
-            # حساب الدائرية
             circularity = (4 * np.pi * area) / (perimeter *
                                                 perimeter) if perimeter > 0 else 0
 
@@ -355,7 +394,7 @@ def analyze_shapes(img_bytes: bytes) -> Dict:
 
             shape_counts[shape_type] += 1
 
-        # إيجاد الشكل المسيطر
+        
         dominant_shape = shape_counts.most_common(
             1)[0][0] if shape_counts else "غير محدد"
 
@@ -376,13 +415,10 @@ def analyze_composition(img_bytes: bytes) -> Dict:
         img = load_and_preprocess_image(img_bytes)
         height, width = img.shape[:2]
 
-        # تقسيم الصورة إلى شبكة 3x3
         grid_h = height // 3
         grid_w = width // 3
 
         brightness_grid = []
-
-        # تحويل إلى تدرج رمادي
         gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
         for i in range(3):
@@ -395,7 +431,6 @@ def analyze_composition(img_bytes: bytes) -> Dict:
                 cell = gray_img[y_start:y_end, x_start:x_end]
 
                 if cell.size > 0:
-                    # متوسط سطوع الخلية
                     brightness = np.mean(cell)
                     brightness_grid.append(brightness)
                 else:
@@ -477,36 +512,14 @@ def blip_caption(image_bytes: bytes) -> str:
     """وصف الصورة باستخدام Hugging Face API"""
     try:
         if not HF_TOKEN:
-            logger.error("❌ HF_TOKEN غير متوفر")
             return "وصف غير متاح - يرجى التحقق من إعدادات النظام"
 
         headers = {"Authorization": f"Bearer {HF_TOKEN}"}
 
-        # نموذج BLIP الأول
-        HF_API_URL = "https://api-inference.huggingface.co/models/nlpconnect/vit-gpt2-image-captioning"
+        HF_API_URL = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-base"
 
         response = requests.post(
             HF_API_URL,
-            headers=headers,
-            data=image_bytes,
-            timeout=30
-        )
-
-        if response.status_code == 200:
-            result = response.json()
-            if isinstance(result, list) and len(result) > 0:
-                caption = result[0].get(
-                    "generated_text") or result[0].get("caption")
-                if caption:
-                    return caption
-
-        # تجربة النموذج الثاني في حال فشل الأول
-        logger.warning(
-            f"⚠️ فشل النموذج الأول ({response.status_code}). تجربة النموذج الثاني...")
-        HF_API_URL_2 = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-base"
-
-        response = requests.post(
-            HF_API_URL_2,
             headers=headers,
             data=image_bytes,
             timeout=30
@@ -519,6 +532,24 @@ def blip_caption(image_bytes: bytes) -> str:
                 if caption:
                     return caption
 
+        # محاولة أخرى للنموذج الأقوى إذا فشل الأول
+        HF_API_URL_2 = "https://api-inference.huggingface.co/models/nlpconnect/vit-gpt2-image-captioning"
+        response = requests.post(
+            HF_API_URL_2,
+            headers=headers,
+            data=image_bytes,
+            timeout=30
+        )
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list) and len(result) > 0:
+                caption = result[0].get(
+                    "generated_text") or result[0].get("caption")
+                if caption:
+                    return caption
+
+        logger.warning(
+            f"⚠️ فشل كشف الوصف. Status: {response.status_code}. Details: {response.text}")
         return "رسم طفل بألوان متنوعة وخطوط معبرة"
 
     except requests.exceptions.Timeout:
@@ -547,7 +578,7 @@ def generate_psychological_analysis(analysis_results: Dict) -> List[str]:
     elif line_pattern == "عمودي":
         psychological_notes.append(
             "الخطوط العمودية تشير إلى الطموح والثقة بالنفس")
-    elif line_pattern == "مائل":
+    elif line_pattern == "مائل/ديناميكي":
         psychological_notes.append(
             "الخطوط المائلة تعبر عن الحركة والطاقة والرغبة في التغيير")
     elif line_pattern == "قليل/غير محدد" and lines.get("total_lines", 0) < 5:
@@ -602,7 +633,7 @@ def generate_educational_advice(analysis_results: Dict) -> List[str]:
     """توليد نصائح تربوية"""
     advice = []
 
-    # نصائح عامة
+ 
     advice.append("شجعوا الطفل على الاستمرار في الرسم والتعبير الفني")
     advice.append("وفرا له أدوات رسم متنوعة الألوان والأنواع")
     advice.append(
@@ -631,9 +662,9 @@ def generate_educational_advice(analysis_results: Dict) -> List[str]:
 
 
 def generate_report(image_bytes: bytes, child_id: str, child_name: str = "", child_age: str = "") -> Dict:
-    """توليد تقرير شامل وإرجاع البيانات الخام"""
+    """توليد تقرير شامل وحفظه في MongoDB"""
 
-    logger.info(f"📊 بدء تحليل رسم الطفل {child_id}")
+    logger.info(f"📊 بدء تحليل وحفظ رسم الطفل {child_id}")
 
     # جمع كل التحليلات
     analysis_results = {
@@ -649,7 +680,7 @@ def generate_report(image_bytes: bytes, child_id: str, child_name: str = "", chi
     psychological_notes = generate_psychological_analysis(analysis_results)
     educational_advice = generate_educational_advice(analysis_results)
 
-    # بناء التقرير النصي (مقسم لتسهيل القراءة)
+    # بناء التقرير النصي
     child_info = child_name if child_name else f"الطفل {child_id}"
     if child_age:
         child_info += f" (العمر: {child_age})"
@@ -738,6 +769,33 @@ def generate_report(image_bytes: bytes, child_id: str, child_name: str = "", chi
         "raw_analysis": analysis_results
     }
 
+    # ---------------------------------------------
+    #   منطق حفظ التقرير في MongoDB 
+    # ---------------------------------------------
+    if REPORT_COLLECTION:
+        try:
+            # يجب التأكد من قراءة parent_email من request.form لأنه غير موجود كـ argument للدالة
+            parent_email = request.form.get('parent_email', 'غير محدد')
+
+            report_document = {
+                "child_id": child_id,
+                "child_name": child_name,
+                "child_age": child_age,
+                "parent_email": parent_email,
+                "full_report_text": full_report_text,
+                "raw_data": analysis_results,
+                "created_at": datetime.utcnow()
+            }
+            # تخزين التقرير 
+            REPORT_COLLECTION.replace_one(
+                {'child_id': child_id},
+                report_document,
+                upsert=True
+            )
+            logger.info(f"تم حفظ التقرير بنجاح في MongoDB لـ {child_id}")
+        except Exception as e:
+            logger.error(f"فشل حفظ التقرير في MongoDB: {e}")
+
     return full_analysis
 
 
@@ -745,12 +803,12 @@ def generate_report(image_bytes: bytes, child_id: str, child_name: str = "", chi
 #  دالة إرسال الإيميل باستخدام SendGrid
 # -------------------------------------------------------------
 def send_email_sendgrid(parent_email: str, subject: str, analysis_data: Dict, child_name: str, child_id: str) -> Tuple[bool, str]:
-    """إرسال إيميل التقرير باستخدام SendGrid API (بدلاً من Gmail/SMTP)"""
+    """إرسال إيميل التقرير باستخدام SendGrid API"""
     try:
         logger.info(f"📧 بدء إرسال إيميل إلى: {parent_email} عبر SendGrid")
 
         if not SENDGRID_API_KEY or not GMAIL_SENDER or not parent_email:
-            return False, "❌ بيانات البريد ناقصة أو إيميل غير صالح أو مفتاح SendGrid مفقود"
+            return False, "بيانات البريد ناقصة أو إيميل غير صالح أو مفتاح SendGrid مفقود"
 
         # 1. تجهيز المحتوى الديناميكي لـ HTML (ملخص النقاط)
         psychological_notes = analysis_data.get('psychological_notes', [])
@@ -891,12 +949,12 @@ def home():
     return jsonify({
         "status": "running",
         "service": "Afaq Drawing Analysis API",
-        "version": "3.2 (CV & SendGrid Integrated)",
+        "version": "4.0 (MongoDB Integrated)",
         "endpoints": {
             "/health": "فحص حالة الخادم",
-            "/analyze": "تحليل الرسم وإرسال التقرير (POST)",
-            "/analyze-only": "تحليل الرسم فقط (POST)",
-            "/report/<child_id>": "عرض التقرير الكامل في المتصفح"
+            "/analyze": "تحليل الرسم وحفظه وإرسال التقرير (POST)",
+            "/analyze-only": "تحليل وحفظ الرسم فقط (POST)",
+            "/report/<child_id>": "عرض التقرير الكامل من MongoDB"
         },
         "documentation": "https://github.com/afaq-project/docs"
     })
@@ -904,34 +962,27 @@ def home():
 
 @app.route('/health')
 def health_check():
-    """فحص حالة الخادم"""
+    """فحص حالة الخادم واتصال MongoDB"""
+    mongo_status = "unconfigured"
+    try:
+        if MONGO_CLIENT:
+            # محاولة عمل أمر بسيط للتحقق
+            MONGO_CLIENT.admin.command('ping')
+            mongo_status = "connected"
+        elif MONGO_URI:
+            mongo_status = "reconnect_needed"
+
+    except Exception:
+        mongo_status = "failed_to_connect"
+
     health_status = {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "hf_token_configured": bool(HF_TOKEN),
         "email_configured": bool(GMAIL_SENDER and SENDGRID_API_KEY),
+        "mongo_status": mongo_status
     }
     return jsonify(health_status)
-
-
-@app.route('/test', methods=['GET'])
-def test_connections():
-    """فحص الاتصالات الخارجية"""
-    tests = {
-        "huggingface": "Skipped (need image)",
-        "sendgrid": False,
-    }
-
-    if SENDGRID_API_KEY:
-        tests["sendgrid"] = "Credentials present"
-    else:
-        tests["sendgrid"] = "no_credentials"
-
-    return jsonify({
-        "status": "success",
-        "tests": tests,
-        "message": "تم فحص الاتصالات (HuggingFace يتطلب إرسال صورة)"
-    })
 
 
 def common_analysis_logic(send_email: bool = True):
@@ -967,21 +1018,18 @@ def common_analysis_logic(send_email: bool = True):
         logger.error(f"خطأ في قراءة ملف الصورة: {e}")
         return jsonify({"status": "error", "message": "خطأ في قراءة ملف الصورة."}), 500
 
-    # 3. توليد التقرير والتحليل الفعلي
+    # 3. توليد التقرير والتحليل الفعلي 
     try:
         analysis_data = generate_report(
             image_bytes, child_id, child_name, child_age)
-        full_report_text = analysis_data['report_text']
 
-        # 4. ✅ تخزين التقرير مؤقتاً لعرضه عبر الرابط
-        REPORTS_CACHE[child_id] = full_report_text
         report_link = f"https://afaq-analysis-api.onrender.com/report/{child_id}"
 
         analysis_time_sec = time.time() - start_time
 
         email_success, email_msg = "لم يُرسل", "لم يُرسل"
 
-        # 5. إرسال الإيميل (إذا طلب ذلك)
+        # 4. إرسال الإيميل 
         if send_email and parent_email:
             email_subject = f"تقرير تحليل رسم الطفل: {child_name}"
             email_success, email_msg = send_email_sendgrid(
@@ -992,10 +1040,10 @@ def common_analysis_logic(send_email: bool = True):
                 child_id=child_id
             )
 
-        # 6. إعداد الاستجابة
+        # 5. إعداد الاستجابة
         response_data = {
             "status": "success",
-            "message": "تم تحليل الرسم وإرسال التقرير بنجاح." if send_email else "تم تحليل الرسم بنجاح.",
+            "message": "تم تحليل الرسم وحفظه وإرسال التقرير بنجاح." if send_email else "تم تحليل الرسم وحفظه بنجاح.",
             "analysis_time": round(analysis_time_sec, 2),
             "child_id": child_id,
             "child_name": child_name,
@@ -1005,56 +1053,77 @@ def common_analysis_logic(send_email: bool = True):
             "raw_analysis": analysis_data['raw_analysis']
         }
 
-        # نرسل التقرير كنص في حالة analyze-only للمراجعة
         if not send_email:
-            response_data["full_report_text"] = full_report_text
+            response_data["full_report_text"] = analysis_data['report_text']
 
         return jsonify(response_data)
 
     except Exception as e:
         logger.error(
-            f"❌ خطأ غير متوقع أثناء التحليل: {traceback.format_exc()}")
+            f"خطأ غير متوقع أثناء التحليل: {traceback.format_exc()}")
         return jsonify({"status": "error", "message": f"حدث خطأ غير متوقع في الخادم: {str(e)}"}), 500
 
 
 @app.route('/analyze', methods=['POST'])
 @rate_limit(max_per_minute=5)
 def analyze_and_send():
-    """تحليل الرسم وإرسال التقرير عبر الإيميل"""
+    """تحليل الرسم وحفظه وإرسال التقرير عبر الإيميل"""
     return common_analysis_logic(send_email=True)
 
 
 @app.route('/analyze-only', methods=['POST'])
 @rate_limit(max_per_minute=10)
 def analyze_without_sending():
-    """تحليل الرسم فقط بدون إرسال الإيميل (للاختبار)"""
+    """تحليل الرسم وحفظه فقط بدون إرسال الإيميل (للاختبار)"""
     return common_analysis_logic(send_email=False)
 
 
 # -------------------------------------------------------------
-#  نقطة نهاية عرض التقرير (لحل مشكلة 404)
+#  نقطة نهاية عرض التقرير (تسحب من MongoDB)
 # -------------------------------------------------------------
 
 @app.route('/report/<string:child_id>')
 def view_report(child_id):
     """
-    نقطة نهاية جديدة لعرض التقرير الكامل في المتصفح.
+    نقطة نهاية لسحب وعرض التقرير الكامل من MongoDB.
     """
-    report_content = REPORTS_CACHE.get(child_id)
+    report_content = None
+
+    if REPORT_COLLECTION:
+        try:
+            # البحث عن التقرير في MongoDB
+            report_doc = REPORT_COLLECTION.find_one({"child_id": child_id})
+
+            if report_doc:
+                report_content = report_doc.get("full_report_text")
+            else:
+                logger.warning(
+                    f"⚠️ لم يتم العثور على التقرير ID: {child_id} في MongoDB.")
+
+        except Exception as e:
+            logger.error(f"خطأ في سحب التقرير من MongoDB: {e}")
+            # إذا فشل الاتصال بقاعدة البيانات
+            return """
+            <!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="UTF-8"><title>خطأ في الخادم</title></head>
+            <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+            <h1>500 - خطأ في الخادم</h1>
+            <p>حدث خطأ أثناء الاتصال بقاعدة البيانات. الرجاء المحاولة لاحقاً أو الاتصال بالدعم الفني.</p>
+            </body></html>
+            """, 500
 
     if report_content is None:
-        # إذا لم يتم العثور على التقرير (404)
+        # إذا لم يتم العثور على التقرير في قاعدة البيانات
         return """
         <!DOCTYPE html>
         <html dir="rtl" lang="ar"><head><meta charset="UTF-8"><title>التقرير غير موجود</title></head>
         <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
         <h1>404 - التقرير غير موجود</h1>
-        <p>قد يكون الرابط خاطئاً، أو أن التقرير انتهت صلاحيته وتم حذف من الخادم.</p>
+        <p>قد يكون الرابط خاطئاً، أو أن التقرير لم يتم حفظه بعد.</p>
         <p>الرجاء التواصل مع الدعم الفني إذا كنت متأكداً من صحة الرابط.</p>
         </body></html>
         """, 404
 
-    # قالب HTML بسيط لعرض التقرير النصي (يستخدم <pre> للحفاظ على التنسيق النصي)
+    # قالب HTML بسيط لعرض التقرير النصي
     html_template = """
     <!DOCTYPE html>
     <html dir="rtl" lang="ar">
@@ -1083,9 +1152,10 @@ def view_report(child_id):
     return render_template_string(html_template, report_content=report_content, child_id=child_id)
 
 # -------------------------------------------------------------
-# تشغيل التطبيق (للتطوير المحلي)
+# تشغيل التطبيق
 # -------------------------------------------------------------
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=True, host='0.0.0.0', port=port)
