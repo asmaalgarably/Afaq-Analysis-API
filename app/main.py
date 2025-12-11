@@ -772,7 +772,7 @@ def generate_report(image_bytes: bytes, child_id: str, child_name: str = "", chi
     # ---------------------------------------------
     #   منطق حفظ التقرير في MongoDB 
     # ---------------------------------------------
-    if REPORT_COLLECTION:
+    if REPORT_COLLECTION is not None:
         try:
             # يجب التأكد من قراءة parent_email من request.form لأنه غير موجود كـ argument للدالة
             parent_email = request.form.get('parent_email', 'غير محدد')
