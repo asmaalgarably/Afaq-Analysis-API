@@ -15,8 +15,8 @@ import time
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 from pymongo import MongoClient
-from pymongo.errors import ConnectionError, OperationFailure
-from bson.json_util import dumps  
+from pymongo.errors import ConnectionFailure, OperationFailure
+from bson.json_util import dumps
 
 # ----------------------------------
 # إعدادات التسجيل
@@ -72,7 +72,7 @@ def setup_mongo():
             "reports")   
         logger.info("تم الاتصال بقاعدة بيانات MongoDB بنجاح.")
         return True
-    except ConnectionError as e:
+    except ConnectionFailure as e:
         logger.error(f"فشل الاتصال بقاعدة بيانات MongoDB: {e}")
         return False
     except Exception as e:
