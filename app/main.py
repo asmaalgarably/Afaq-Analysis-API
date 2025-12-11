@@ -533,7 +533,7 @@ def blip_caption(image_bytes: bytes) -> str:
                     return caption
 
         # محاولة أخرى للنموذج الأقوى إذا فشل الأول
-        HF_API_URL_2 = "https://api-inference.huggingface.co/models/nlpconnect/vit-gpt2-image-captioning"
+        HF_API_URL_2 = "https://router.huggingface.co//models/nlpconnect/vit-gpt2-image-captioning"
         response = requests.post(
             HF_API_URL_2,
             headers=headers,
@@ -1089,7 +1089,7 @@ def view_report(child_id):
     """
     report_content = None
 
-    if REPORT_COLLECTION:
+    if REPORT_COLLECTION is not None:
         try:
             # البحث عن التقرير في MongoDB
             report_doc = REPORT_COLLECTION.find_one({"child_id": child_id})
